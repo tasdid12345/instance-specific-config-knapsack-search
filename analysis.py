@@ -1,15 +1,18 @@
 """Instance-specific parameter selection for a 0/1 knapsack local search.
-Baseline: standard MLPClassifier on instance features.
-Improved: class-balanced LightGBM with CV-tuned hyperparameters, same features.
-Both models share data, labels, features, evaluation table and seeds."""
+Baseline: standard MLPClassifier on instance features (unchanged).
+Improved: per-setting LightGBM quality regressors (one per local-search setting, trained on
+the training-set mean normalised quality of every setting), hyperparameters tuned by 3-fold CV
+on the TRAIN set only, and predictions averaged over model seeds. The chosen setting is the one
+with the highest predicted quality. Both models share data, features, evaluation table and seeds."""
 import json, os, sys, time
+from itertools import product
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMRegressor
 from sklearn.metrics import f1_score
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -106,6 +109,17 @@ def evaluate(model_preds, Qte, yte):
         out["f1"].append(f1_score(yte, pred, average="macro", zero_division=0))
     return {k: np.array(v) for k, v in out.items()}
 
+def fit_quality_regressors(X, Qm, params, seed):
+    """One LightGBM regressor per setting, predicting that setting's mean normalised quality."""
+    return [LGBMRegressor(**params, subsample=0.8, subsample_freq=1, verbose=-1,
+                          random_state=seed).fit(X, Qm[:, k])
+            for k in range(Qm.shape[1])]
+
+def pick_setting(models, X):
+    """Choose the setting with the highest predicted quality."""
+    P = np.column_stack([m.predict(X) for m in models])
+    return P.argmax(1)
+
 def main():
     rng = np.random.default_rng(SEED)
     log("Generating instances (train: small/mixed; test: shifted larger/other correlations)")
@@ -114,7 +128,8 @@ def main():
     log("Computing exact optima and local-search quality tables")
     Qtr, Qte = quality_table(train, SEEDS), quality_table(test, SEEDS)
     # Labels: best setting by mean quality over search seeds, on TRAIN only
-    ytr = Qtr.mean(2).argmax(1)
+    Qm_tr = Qtr.mean(2)
+    ytr = Qm_tr.argmax(1)
     yte = Qte.mean(2).argmax(1)              # oracle labels, used only for secondary metrics
     if len(np.unique(ytr)) < 2:
         log("ERROR: fewer than two setting classes in training labels; no meaningful model")
@@ -123,7 +138,7 @@ def main():
     Xte = np.array([features(*t) for t in test])
     log(f"Label distribution (train): {np.bincount(ytr, minlength=len(SETTINGS)).tolist()}")
 
-    # Baseline: standard MLP (scaled inputs, no tuning, no class balancing)
+    # Baseline: standard MLP (scaled inputs, no tuning, no class balancing) -- unchanged
     log("Fitting baseline MLP")
     base_preds = []
     for sd in SEEDS:
@@ -131,19 +146,29 @@ def main():
                                                             early_stopping=True, random_state=sd))
         base_preds.append(mlp.fit(Xtr, ytr).predict(Xte).astype(int))
 
-    # Improved: class-balanced LightGBM, hyperparameters tuned by 3-fold CV on TRAIN only
-    log("Tuning LightGBM by cross-validation on training set")
-    lgb_base = LGBMClassifier(class_weight="balanced", subsample=0.8, subsample_freq=1,
-                              verbose=-1, random_state=SEED)
+    # Improved: quality-regression selector, hyperparameters tuned by 3-fold CV on TRAIN only.
+    # CV objective = mean true training quality of the setting chosen on the held-out fold.
+    log("Tuning quality-regression LightGBM by cross-validation on training set")
     grid = {"num_leaves": [7, 15], "learning_rate": [0.05, 0.1],
             "n_estimators": [100, 300], "min_child_samples": [5, 15]}
-    gs = GridSearchCV(lgb_base, grid, cv=StratifiedKFold(3, shuffle=True, random_state=SEED),
-                      scoring="balanced_accuracy", n_jobs=1).fit(Xtr, ytr)
-    log(f"Best CV params {gs.best_params_}, CV balanced accuracy {gs.best_score_:.3f}")
+    kf = KFold(3, shuffle=True, random_state=SEED)
+    best_cv, best_params = -np.inf, None
+    for vals in product(*grid.values()):
+        params = dict(zip(grid.keys(), vals))
+        fold_scores = []
+        for tr_idx, va_idx in kf.split(Xtr):
+            ms = fit_quality_regressors(Xtr[tr_idx], Qm_tr[tr_idx], params, SEED)
+            pick = pick_setting(ms, Xtr[va_idx])
+            fold_scores.append(Qm_tr[va_idx, pick].mean())
+        cv = float(np.mean(fold_scores))
+        if cv > best_cv:
+            best_cv, best_params = cv, params
+    log(f"Best CV params {best_params}, CV mean quality {best_cv:.4f}")
+
     imp_preds = []
     for sd in SEEDS:
-        m = LGBMClassifier(**{**lgb_base.get_params(), **gs.best_params_, "random_state": sd})
-        imp_preds.append(m.fit(Xtr, ytr).predict(Xte).astype(int))
+        ms = fit_quality_regressors(Xtr, Qm_tr, best_params, sd)
+        imp_preds.append(pick_setting(ms, Xte).astype(int))
 
     log("Evaluating both models on held-out shifted test set")
     b, im = evaluate(base_preds, Qte, yte), evaluate(imp_preds, Qte, yte)
@@ -152,8 +177,9 @@ def main():
         "question": "Can a cross-validation-tuned, class-balanced LightGBM classifier choose a better "
                     "per-instance local-search parameter setting than a standard MLP configuration "
                     "predictor on generated knapsack instances, judged by the same held-out solution quality?",
-        "method": "Generated 0/1 knapsack instances (fixed seed) labelled with the best local-search setting "
-                  "under a fixed evaluation budget; MLP baseline vs CV-tuned class-balanced LightGBM; "
+        "method": "Generated 0/1 knapsack instances (fixed seed) with per-setting local-search quality "
+                  "measured under a fixed evaluation budget; MLP baseline (classifier) vs CV-tuned "
+                  "per-setting LightGBM quality regressors choosing the highest predicted setting; "
                   "test set from a shifted instance family; evaluated by mean normalised solution quality.",
         "dataset": {"name": "Generated 0/1 knapsack instances (simulation, numpy seed 42)",
                     "source_url": "https://numpy.org", "n_rows": N_TRAIN + N_TEST,
@@ -162,7 +188,8 @@ def main():
         "metric_name": "mean normalised solution quality (value / optimum) on held-out test instances",
         "higher_is_better": True,
         "baseline": "Standard MLPClassifier (64-32 hidden, scaled features) predicting the local-search setting",
-        "improved": "Class-balanced LightGBM with 3-fold CV-tuned hyperparameters on the same features and labels",
+        "improved": "Per-setting LightGBM quality regressors (3-fold CV-tuned on training quality, "
+                    "seed-averaged models) on the same features; choose the setting with highest predicted quality",
         "metrics": {
             "baseline_score": float(b["score"].mean()),
             "improved_score": float(im["score"].mean()),
@@ -176,12 +203,14 @@ def main():
             "baseline_f1": float(b["f1"].mean()),
             "improved_f1": float(im["f1"].mean()),
             "oracle_score": float(oracle),
-            "lgbm_cv_balanced_accuracy": float(gs.best_score_),
+            "lgbm_cv_mean_quality": float(best_cv),
         },
-        "notes": "Labels are noisy (single small grid, budget-limited search); test family is shifted in "
-                 "size and correlation, so tree models cannot extrapolate in size. Test set used once for "
-                 "both models; LightGBM tuning used only training CV. Results depend on the generator and "
-                 "budget and are not a replication of OPTICAT's deep RL results.",
+        "notes": "Labels are noisy (single small grid, budget-limited search). The improved model uses the "
+                 "full per-setting quality information from training rather than only the argmax label, "
+                 "so it is not tied to label noise. Test family is shifted in size and correlation, so tree "
+                 "models cannot extrapolate in size. Test set used once for both models; tuning used only "
+                 "training CV. Results depend on the generator and budget and are not a replication of "
+                 "OPTICAT's deep RL results.",
     }
     with open("results.json", "w", encoding="utf-8") as f:
         json.dump(res, f, indent=2)

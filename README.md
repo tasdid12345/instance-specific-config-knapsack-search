@@ -1,21 +1,26 @@
-# Instance-specific local-search tuning for knapsack: MLP baseline vs CV-tuned LightGBM
+# Knapsack local-search setting selection
 
-This experiment is motivated by "OPTICAT: A Deep Reinforcement Learning Framework for Instance-Specific Algorithm Configuration" (2026), which proposes choosing algorithm parameter settings separately for each problem instance. Here we ask a simpler, supervised version of that question: given cheap features of a 0/1 knapsack instance, can a predictor pick the local-search setting that yields the best solution within a fixed evaluation budget? The paper's deep RL policy is replaced by a standard MLP baseline.
+Question: can a CV-tuned LightGBM selector choose a better per-instance local-search setting than a standard MLP predictor, judged by held-out normalised solution quality (value / DP optimum)?
 
-**Question:** Can a cross-validation-tuned, class-balanced LightGBM classifier choose a better per-instance local-search parameter setting than a standard MLP configuration predictor on generated knapsack instances, when both are judged by the same held-out solution quality?
+## Data
+Generated 0/1 knapsack instances (numpy seed 42). Training set: 700 small/mixed instances (20–50 items). Held-out test set: 300 shifted, larger instances (60–100 items) with different value-weight correlations.
 
-**Dataset:** Generated 0/1 knapsack instances created in code with a fixed numpy seed (a simulation, no download). Training instances come from one family (smaller, mixed correlations); the held-out test set comes from a shifted family (larger, different correlation mix). This is not the paper's own dataset.
+## Methods
+- Labels: the local-search setting (restarts × step size, 6 candidates) with the highest mean quality over three search seeds, computed on training instances only.
+- Baseline (unchanged): `MLPClassifier((64, 32))` on standardised instance features, predicting the setting; averaged over seeds 42–44.
+- Improved: one LightGBM regressor per setting, predicting its training-set mean quality from the same features. The chosen setting is the one with the highest predicted quality. Hyperparameters (num_leaves, learning_rate, n_estimators, min_child_samples) are selected by 3-fold CV on the training set only, scored by true training quality of the chosen setting. Final predictions use seeds 42–44.
 
-**Baseline vs improved:** The baseline is a standard MLPClassifier on instance features. The improved model is a class-balanced LightGBM with hyperparameters chosen by cross-validation on the training set, using the same features, labels and evaluation.
+The test set is used once for the final comparison; it is never used for tuning.
 
-## How to run
-
+## Run
 ```
 pip install -r requirements.txt
 python analysis.py
 ```
+Outputs `results.json` and `figures/quality_comparison.png`. Runtime is well under 20 minutes on CPU.
 
-Results: results are written to results.json (and a chart to figures/).
+## Caveats
+Labels come from a single small grid and a fixed evaluation budget. The test family is shifted in size and correlation, so tree models cannot extrapolate in instance size. Results are a simulation and do not replicate OPTICAT's deep RL results.
 
 ## Reference
 
