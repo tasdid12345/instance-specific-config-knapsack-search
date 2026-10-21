@@ -18,6 +18,30 @@ python analysis.py
 ```
 Writes `results.json` and `figures/quality_comparison.png`.
 
+## Results (latest run)
+
+On the generated 0/1 knapsack test set (300 shifted-family instances), a standard MLP configuration predictor reached 0.970 mean normalised solution quality, while my LightGBM+ExtraTrees ensemble reached 0.970, a negligible difference (0.00001), and its top-1 accuracy fell from 57% to 43%.
+
+| Metric | Value |
+|---|---|
+| baseline_score | 0.97 |
+| improved_score | 0.97 |
+| improvement | 0.000009955 |
+| baseline_score_std | 0.0002229 |
+| improved_score_std | 0.0001082 |
+| baseline_top1_accuracy | 0.5733 |
+| improved_top1_accuracy | 0.4256 |
+| baseline_within1pct | 0.9756 |
+| improved_within1pct | 0.9744 |
+| baseline_f1 | 0.1215 |
+| improved_f1 | 0.2065 |
+| oracle_score | 0.9712 |
+| lgbm_cv_mean_quality | 0.9594 |
+
+Run on 2026-10-21. Full output: [results.json](results.json) · [run.log](run.log)
+
+Notes: Labels are noisy (single small grid, budget-limited search). The improved model uses the full per-setting quality information from training rather than only the argmax label, so it is not tied to label noise. Improvements over the previous version: scale-free greedy/LP-bound features (improved model only), row-centred regression targets (argmax unchanged), and an LightGBM+ExtraTrees ensemble. Test family is shifted in size and correlation, so tree models cannot extrapolate in size; the scale-free features are meant to help with this. Test set used once for both models; tuning used only training CV. Results depend on the generator and budget and are not a replication of OPTICAT's deep RL results.
+
 ## Reference
 
 This project is motivated by the following paper:
